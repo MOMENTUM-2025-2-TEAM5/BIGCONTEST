@@ -1,13 +1,10 @@
 import os
 import re
 import pandas as pd
-from typing import TypedDict, Annotated, List
+from typing import TypedDict, List
 from dotenv import load_dotenv
 
-from langchain_core.messages import BaseMessage, HumanMessage, ToolMessage
-from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph import StateGraph, START, END
-from langgraph.graph.message import add_messages
 
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_experimental.agents.agent_toolkits import create_pandas_dataframe_agent
@@ -16,21 +13,27 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain.docstore.document import Document
-from langchain.prompts import ChatPromptTemplate
+
+from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.exceptions import OutputParserException
 
-# ====== 환경 변수 로드 ======
+# =========================
+# Loading API Key
+# =========================
 load_dotenv()
 API_KEY = os.getenv("API_KEY")
 
-# ====== LLM 및 Embeddings 설정 ======
+# =========================
+# LLM / Embeddings
+# =========================
 llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=API_KEY)
 embeddings = GoogleGenerativeAIEmbeddings(
     model="models/text-embedding-004", google_api_key=API_KEY
 )
 
-
-# ====== 데이터 준비 및 Pandas Agent 생성 ======
+# =========================
+# Loading Data + Pandas Agent
+# =========================
 df = pd.read_excel("public/최종 데이터셋.xlsx")
 df_storetype_sales_competition = pd.read_csv(
     "public/상권_업종별_매출_경쟁강도_분석결과리스트.csv"
@@ -56,7 +59,9 @@ pandas_agent = create_pandas_dataframe_agent(
 )
 
 
-# === RAG 초기화 함수 ===
+# =========================
+# Initailizing RAG
+# =========================
 def initialize_rag(
     embeddings,
     pdf_folder: str = "public/rag_documents",
@@ -64,7 +69,8 @@ def initialize_rag(
 ):
     os.makedirs(persist_path, exist_ok=True)
 
-    if os.path.exists(os.path.join(persist_path, "index.faiss")):
+    faiss_index_path = os.path.join(persist_path, "index.faiss")
+    if os.path.exists(faiss_index_path):
         print("Loading existing FAISS vectorstore from disk...")
         vectorstore = FAISS.load_local(
             persist_path, embeddings, allow_dangerous_deserialization=True
@@ -73,6 +79,9 @@ def initialize_rag(
         print("Creating new FAISS vectorstore from PDF documents...")
 
         all_docs: List[Document] = []
+        if not os.path.exists(pdf_folder):
+            raise FileNotFoundError(f"No RAG Folder: {pdf_folder}")
+
         for file in os.listdir(pdf_folder):
             if file.endswith(".pdf"):
                 loader = PyPDFLoader(os.path.join(pdf_folder, file))
@@ -86,7 +95,7 @@ def initialize_rag(
 
         vectorstore = FAISS.from_documents(split_docs, embeddings)
         vectorstore.save_local(persist_path)
-        print("Complteted creating and saving FAISS vectorstore.")
+        print("Completed creating and saving FAISS vectorstore.")
 
     retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
     return retriever
@@ -98,9 +107,13 @@ marketing_prompt = ChatPromptTemplate.from_template(
     """
 당신은 최고의 마케팅 전략가입니다.
 당신은 성동구의 식당, 카페 가맹점들에 대해 마케팅 전략을 수립하는 역할을 합니다.
-사용자 질문에 대한 효과적인 마케팅 전략을 제안하세요. 
-"데이터 분석"이 있다면 반드시 참고하여 답변하고 참고 자료를 최대한 활용하세요. 
-제안한 마케팅 전략에는 근거를 반드시 포함하세요. 
+
+규칙:
+- "데이터 분석"을 반드시 참고하세요.
+- "참고 자료(RAG)"를 최대한 활용하세요.
+- 전략에는 실행 방안(무엇/어디서/어떻게)을 포함하세요.
+- 전략의 근거를 반드시 포함하세요(데이터 분석 기반 + 참고 자료 기반).
+- 가능하면 어떤 문서/페이지를 참고했는지 언급하세요.
 
 [데이터 분석]
 {analysis_result}
@@ -116,129 +129,153 @@ marketing_prompt = ChatPromptTemplate.from_template(
 )
 
 
-def rag_chain(query: str, analysis_result: str) -> str:
-    """RAG 기반 마케팅 전략 생성"""
+def rag_chain(query: str, analysis_result: str) -> tuple[str, str, str, str]:
     docs = retriever.invoke(query)
-    context = "\n".join([d.page_content for d in docs])
+    context = "\n\n".join([d.page_content for d in docs])
+
+    # 문서 목록
+    debug_lines = []
+    for i, d in enumerate(docs, 1):
+        src = d.metadata.get("source", "unknown")
+        page = d.metadata.get("page", "unknown")
+        preview = d.page_content[:200].replace("\n", " ")
+        debug_lines.append(f"{i}) source={src} page={page} preview={preview}...")
+    rag_debug = "\n".join(debug_lines)
+
+    # RAG 디버깅 및 근거, 출처 표시
+    ref_lines = []
+    for i, d in enumerate(docs, 1):
+        src = d.metadata.get("source", "unknown")
+        page = d.metadata.get("page", "unknown")
+        excerpt = d.page_content.strip().replace("\n", " ")
+        excerpt = excerpt[:250] + ("..." if len(excerpt) > 250 else "")
+        ref_lines.append(f"- [{i}] {src} (p.{page})\n  └ 인용: {excerpt}")
+
+    rag_refs = "\n".join(ref_lines)
+    rag_query = query
+
     prompt_text = marketing_prompt.format_prompt(
         context=context, question=query, analysis_result=analysis_result
     ).to_string()
 
-    return llm.invoke(prompt_text)
+    strategy = llm.invoke(prompt_text).content
+    return strategy, rag_debug, rag_query, rag_refs
 
 
-# ====== State 정의 ======
+# =========================
+# State
+# =========================
 class State(TypedDict):
     query: str
+    store_code: str
+    user_goal: str
     analysis_result: str
     marketing_strategy: str
-    chain_both: bool
-    next_node: str
+    rag_debug: str
+    rag_query: str
+    rag_refs: str
     final_answer: str
 
 
-# ====== Node 정의 ======
+# =========================
+# Nodes
+# =========================
+def query_analyzer_node(state: State) -> State:
+    """
+    사용자 질의 에이전트:
+    - 가맹점코드 추출
+    - user_goal 저장
+    """
+    q = state["query"]
+
+    m = re.search(r"\b[A-Z0-9]{10}\b", q.upper())
+    store_code = m.group(0) if m else ""
+
+    goal = q.replace(store_code, "").strip() if store_code else q.strip()
+
+    state["store_code"] = store_code
+    state["user_goal"] = goal
+    return state
+
+
 def data_analyst_node(state: State) -> State:
     """
-    데이터 분석 노드
-    - 열자리의 가맹점구분번호를 기준으로 분석 수행할 것 (가맹점구분번호 예시: 01EDD97C21 등)
-    - 필요한 데이터프레임을 선택하고 마지막 사용자 메시지의 의도를 파악하여 분석 수행
-    - 결과를 ToolMessage로 반환
-    - 필요시 여러 데이터프레임을 분석 후 결과를 정리
+    데이터 분석 에이전트:
+    - 분석/인사이트만 생성 (전략 제안 X)
     """
     query = state["query"]
-    prompt = f"query: {query}\n당신은 데이터 분석가 입니다. 사용자 쿼리에 맞게 주어진 데이터프레임들을 분석하여 마케팅 전략 수립가에게 분석 결과 및 인사이트를 넘겨주어야 합니다. 전략 제안은 당신의 역할이 아닙니다. 데이터 분석만 진행하세요. "
+    store_code = state.get("store_code", "")
+    goal = state.get("user_goal", "")
+
+    prompt = f"""
+당신은 데이터 분석가입니다.
+역할: 마케팅 전략을 직접 제안하지 말고, 주어진 데이터프레임들을 분석해 전략가에게 전달할 인사이트를 만드세요.
+
+입력:
+- 사용자 질문: {query}
+- 가맹점구분번호(있다면): {store_code}
+- 사용자의 목표/요청: {goal}
+
+규칙:
+- 가능한 한 가맹점구분번호 기준으로 해당 가게의 매출/고객/상권 특성 분석
+- 필요 시 업종별/상권별 경쟁강도/특징 분석 데이터도 비교 인사이트로 활용
+- 결과는 '핵심 요약 + 근거 지표/관찰 + 시사점' 구조
+"""
+
     try:
         analysis_result = pandas_agent.invoke(prompt)
         response_content = analysis_result["output"]
     except (OutputParserException, ValueError) as e:
         error_message = str(e)
-
         match = re.search(
             r"Could not parse LLM output: `(.*)`", error_message, re.DOTALL
         )
-
         if match:
             response_content = match.group(1).strip()
         else:
-            response_content = (
-                "에이전트 파싱 오류가 발생했으나 원본 텍스트를 추출하지 못했습니다."
-            )
+            response_content = "원본 텍스트를 추출하지 못함"
+
     state["analysis_result"] = response_content
     return state
 
 
 def marketing_strategist_node(state: State) -> State:
     """
-    마케팅 전략 노드
-    - RAG 기반 전략 생성
-    - 반드시 근거가 포함된 전략 제안
-    - 어떤 문서의 어떤 부분을 참고했는지 포함
+    마케팅 전략 에이전트(RAG):
+    - query(사용자 질문)로 검색
+    - 분석 결과 + RAG 컨텍스트로 전략 생성
+    - rag_query / rag_refs 저장
     """
     query = state["query"]
-    prompt = f"query: {query}\n당신은 최고의 마케팅 전략가입니다. 사용자 질문에 대한 효과적인 마케팅 전략을 제안하세요. 데이터 분석값이 있다면 반드시 참고하여 답변하고 참고 자료를 최대한 활용하세요. 제안한 마케팅 전략에는 근거를 반드시 포함하세요."
     analysis_result = state.get("analysis_result", "")
-    strategy = rag_chain(prompt, analysis_result).content
+
+    strategy, rag_debug, rag_query, rag_refs = rag_chain(query, analysis_result)
+
     state["marketing_strategy"] = strategy
+    state["rag_debug"] = rag_debug
+    state["rag_query"] = rag_query
+    state["rag_refs"] = rag_refs
     return state
 
 
-def supervisor_node(state: State) -> State:
+def final_summarizer_node(state: State) -> State:
     """
-    슈퍼바이저 노드
-    - 사용자 질문 분석 후 다음에 실행할 노드를 결정
-    - 그래프 흐름 제어
-    """
-    query = state["query"]
-    llm_prompt = """
-당신은 성동구 가맹점 마케팅 컨설팅 및 데이터 분석 AI들의 총괄입니다.
-가맹점주들의 요구에 맞는 최적의 전문가를 배정하세요. 
-사용자 질문을 보고 필요한 전문가를 결정하세요:
-- 데이터 분석 필요 → data_analyst
-    - 성동구 전체 가맹점 데이터(매출, 고객 정보 등), 상권 및 업종 별 경쟁 강도와 특징 분석 데이터 보유 중
-- 마케팅 전략 필요 → marketing_strategist
-- 둘 다 필요 → both
-- 둘 다 필요 없음 → FINISH
-출력은 반드시 다음 중 하나: data_analyst, marketing_strategist, both, FINISH
-"""
-    decision_input = f"{llm_prompt}\n[질문]\n{query}"
-    decision = llm.invoke(decision_input).content.strip()
-
-    if decision not in ["data_analyst", "marketing_strategist", "both", "FINISH"]:
-        decision = "FINISH"
-
-    print(f"DEBUG: Supervisor 판단 -> {decision}")
-
-    if decision == "data_analyst":
-        state["next_node"] = "data_analyst"
-    elif decision == "marketing_strategist":
-        state["next_node"] = "marketing_strategist"
-    elif decision == "both":
-        state["next_node"] = "data_analyst"
-        state["chain_both"] = True
-    elif decision == "FINISH":
-        analysis = state.get("analysis_result", "")
-        marketing = state.get("marketing_strategy", "")
-
-    return state
-
-
-def summerize_final_answer_node(state: State) -> dict:
-    """
-    최종 요약 답변 생성 노드
-    - 데이터 분석 결과와 마케팅 전략을 종합하여 최종 답변 생성
+    요약 에이전트
     """
     query = state["query"]
     analysis_result = state.get("analysis_result", "")
     marketing_strategy = state.get("marketing_strategy", "")
+    rag_query = state.get("rag_query", "")
+    rag_refs = state.get("rag_refs", "")
 
-    if analysis_result or marketing_strategy:
-        summary_prompt = f"""
-당신은 가맹점 컨설팅 AI돌 중 결과 정리 역할입니다.
-다음은 지금까지 수행된 분석 및 전략 제안 결과입니다.
-사용자 질의에 맞는 답변을 생성하세요.
-이를 참고하여 핵심만 요약해 사용자에게 한눈에 보이게 정리하세요.
-데이터 분석 내용과 마케팅 전략의 근거를 반드시 명시해야 합니다.
+    summary_prompt = f"""
+당신은 가맹점 컨설팅 결과 정리 담당입니다.
+아래 내용을 바탕으로 "최종 정리"만 작성하세요.
+
+요구:
+- 짧고 핵심 위주
+- 근거(데이터/문서 기반) 포인트를 3개 내외 bullet로 포함
+- 사용자 질문에 직접 답하도록 구성
 
 [사용자 질문]
 {query}
@@ -249,49 +286,44 @@ def summerize_final_answer_node(state: State) -> dict:
 [마케팅 전략 제안]
 {marketing_strategy}
 
-[요약 및 최종 제안]
+[최종 정리]
 """
-        final_answer = llm.invoke(summary_prompt).content
-        state["final_answer"] = final_answer
+    summary = llm.invoke(summary_prompt).content
+
+    rag_footer = ""
+    if rag_query or rag_refs:
+        rag_footer = "\n\n[RAG 참고]\n" f"- 검색 질의: {rag_query}\n" f"{rag_refs}"
+
+    state["final_answer"] = (
+        f"[데이터 분석]\n{analysis_result}\n\n"
+        f"[마케팅 전략 수립]\n{marketing_strategy}\n\n"
+        f"[최종 정리]\n{summary}"
+        f"{rag_footer}"
+    )
     return state
 
 
-# ====== Graph 설정 ======
-workflow = StateGraph(State)
+# =========================
+# Graph
+# =========================
+graph = StateGraph(State)
 
-workflow.add_node("supervisor", supervisor_node)
-workflow.add_node("data_analyst", data_analyst_node)
-workflow.add_node("marketing_strategist", marketing_strategist_node)
-workflow.add_node("final_summarizer", summerize_final_answer_node)
+graph.add_node("query_analyzer", query_analyzer_node)
+graph.add_node("data_analyst", data_analyst_node)
+graph.add_node("marketing_strategist", marketing_strategist_node)
+graph.add_node("final_summarizer", final_summarizer_node)
 
-workflow.add_edge(START, "supervisor")
+graph.add_edge(START, "query_analyzer")
+graph.add_edge("query_analyzer", "data_analyst")
+graph.add_edge("data_analyst", "marketing_strategist")
+graph.add_edge("marketing_strategist", "final_summarizer")
+graph.add_edge("final_summarizer", END)
 
-workflow.add_conditional_edges(
-    "supervisor",
-    lambda state: state["next_node"],
-    {
-        "data_analyst": "data_analyst",
-        "marketing_strategist": "marketing_strategist",
-        "both": "data_analyst",
-        "FINISH": "final_summarizer",
-    },
-)
+agents = graph.compile()
 
-workflow.add_conditional_edges(
-    "data_analyst",
-    lambda state: "marketing_strategist" if state.get("chain_both") else "FINISH",
-    {
-        "marketing_strategist": "marketing_strategist",
-        "FINISH": "final_summarizer",
-    },
-)
-
-workflow.add_edge("marketing_strategist", "final_summarizer")
-workflow.add_edge("final_summarizer", END)
-
-app = workflow.compile()
-
-# ====== Main Loop ======
+# =========================
+# CLI
+# =========================
 if __name__ == "__main__":
     print("\n채팅 시작 (exit/q 입력 시 종료)")
     while True:
@@ -299,25 +331,24 @@ if __name__ == "__main__":
         if user_input.lower() in ["exit", "q"]:
             break
 
-        state = {
+        state: State = {
             "query": user_input,
+            "store_code": "",
+            "user_goal": "",
             "analysis_result": "",
             "marketing_strategy": "",
-            "chain_both": False,
-            "next_node": "",
+            "rag_debug": "",
+            "rag_query": "",
+            "rag_refs": "",
             "final_answer": "",
         }
 
-        result = app.invoke(state)
+        result = agents.invoke(state)
 
-        # ====== 결과 출력 ======
         print("\n" + "=" * 60)
-        print("📊 [데이터 분석 결과]")
-        print(result.get("analysis_result", "(없음)"))
+        print("🧾 [RAG DEBUG]")
+        print(result.get("rag_debug", "(없음)"))
 
-        print("\n💡 [마케팅 전략 제안]")
-        print(result.get("marketing_strategy", "(없음)"))
-
-        print("\n🧭 [최종 요약 답변]")
+        print("\n🧭 [FINAL ANSWER]")
         print(result.get("final_answer", "(없음)"))
         print("=" * 60)
