@@ -78,8 +78,6 @@ urllib3==2.5.0
 xxhash==3.6.0
 yarl==1.22.0
 zstandard==0.25.0
-
-# 대시보드 추가 패키지
 streamlit==1.52.1
 plotly==6.5.0
 scikit-learn==1.6.1
