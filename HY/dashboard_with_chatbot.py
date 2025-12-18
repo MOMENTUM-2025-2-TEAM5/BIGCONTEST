@@ -1,3 +1,9 @@
+"""
+가맹점 분석 대시보드 + AI 챗봇 통합 버전
+- 기존 dashboard.py의 분석 기능
+- chatbot_module.py의 AI 컨설팅 챗봇
+"""
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -15,7 +21,9 @@ from clustering import (
 )
 
 # 페이지 설정
-st.set_page_config(page_title="가맹점 분석 대시보드", page_icon="📊", layout="wide")
+st.set_page_config(
+    page_title="가맹점 분석 대시보드 + AI 컨설턴트", page_icon="🤖", layout="wide"
+)
 
 # 커스텀 CSS
 st.markdown(
@@ -33,12 +41,26 @@ st.markdown(
         padding: 15px;
         box-shadow: 0 2px 4px rgba(0,0,0,0.1);
     }
+    .chat-message {
+        padding: 1rem;
+        border-radius: 0.5rem;
+        margin-bottom: 1rem;
+        display: flex;
+        flex-direction: column;
+    }
+    .chat-message.user {
+        background-color: #e3f2fd;
+    }
+    .chat-message.assistant {
+        background-color: #f5f5f5;
+    }
 </style>
 """,
     unsafe_allow_html=True,
 )
 
 
+# ==================== 데이터 로드 함수 ====================
 @st.cache_data
 def load_data():
     """데이터 로드 및 전처리"""
@@ -140,14 +162,29 @@ def get_store_summary(df):
     return summary
 
 
-def main():
+# ==================== 챗봇 초기화 ====================
+@st.cache_resource
+def get_chatbot():
+    """챗봇 매니저 초기화 (싱글톤)"""
+    try:
+        from chatbot_module import ChatbotManager
+
+        chatbot = ChatbotManager()
+        chatbot.initialize()
+        return chatbot, None
+    except ImportError as e:
+        return None, f"챗봇 모듈 로드 실패: {e}"
+    except ValueError as e:
+        return None, f"API 키 오류: {e}"
+    except Exception as e:
+        return None, f"챗봇 초기화 실패: {e}"
+
+
+# ==================== 대시보드 페이지 ====================
+def dashboard_page(df, store_summary):
+    """대시보드 메인 페이지"""
     st.title("📊 가맹점 분석 대시보드")
     st.markdown("서울 성동구 가맹점 데이터 분석 (2023.01 ~ 2024.12)")
-
-    # 데이터 로드
-    with st.spinner("데이터를 불러오는 중..."):
-        df = load_data()
-        store_summary = get_store_summary(df)
 
     # ==================== 사이드바 필터 ====================
     st.sidebar.header("🔍 필터 설정")
@@ -237,6 +274,9 @@ def main():
 
     selected_store = filtered_summary.iloc[selected_store_idx]
     store_id = selected_store["가맹점구분번호"]
+
+    # 세션에 선택된 가맹점 저장 (챗봇에서 활용)
+    st.session_state["selected_store"] = selected_store.to_dict()
 
     # 해당 가맹점의 시계열 데이터
     store_data = df[df["가맹점구분번호"] == store_id].sort_values("기준년월")
@@ -463,7 +503,7 @@ def main():
         ).mean() * 100
         st.write(f"현재 가맹점은 상위 **{100-percentile:.1f}%** 위치")
 
-    # ==================== 프랜차이즈 비교 (해당되는 경우) ====================
+    # ==================== 프랜차이즈 비교 ====================
     same_brand = store_summary[
         store_summary["브랜드구분코드"] == selected_store["브랜드구분코드"]
     ]
@@ -475,7 +515,6 @@ def main():
             f"**{selected_store['브랜드구분코드']}** 브랜드의 가맹점 **{len(same_brand)}개** 비교"
         )
 
-        # 프랜차이즈 내 순위 테이블
         brand_comparison = same_brand[
             ["가맹점명", "상권", "평균매출구간", "평균별점", "평균재방문비중"]
         ].copy()
@@ -485,7 +524,6 @@ def main():
             ["순위", "가맹점명", "상권", "평균매출구간", "평균별점", "평균재방문비중"]
         ]
 
-        # 현재 가맹점 하이라이트
         current_rank = brand_comparison[
             brand_comparison["가맹점명"] == selected_store["가맹점명"]
         ]["순위"].values[0]
@@ -511,11 +549,9 @@ def main():
     st.markdown("---")
     st.subheader("🎯 클러스터 분석")
 
-    # 클러스터링 실행 (캐싱)
     @st.cache_data
     def run_clustering(df):
         store_cluster_df = prepare_clustering_data(df)
-        # kmodes 설치 여부에 따라 분기
         try:
             result, model = run_kprototypes_clustering(store_cluster_df, n_clusters=5)
             if result is None:
@@ -531,7 +567,6 @@ def main():
     df_clustered, cluster_method = run_clustering(df)
     cluster_profiles = get_cluster_profiles(df_clustered)
 
-    # 현재 가맹점의 클러스터 정보
     store_cluster_info = df_clustered[df_clustered["가맹점구분번호"] == store_id]
 
     if len(store_cluster_info) > 0:
@@ -545,14 +580,12 @@ def main():
             st.info(f"**{cluster_name}** (클러스터 {current_cluster})")
             st.caption(f"분석 방법: {cluster_method}")
 
-            # 같은 클러스터 가맹점 수
             same_cluster_count = (df_clustered["클러스터"] == current_cluster).sum()
             st.write(f"같은 클러스터 가맹점: **{same_cluster_count}개**")
 
         with col2:
             st.markdown("#### 클러스터별 특성")
 
-            # 클러스터 프로필 시각화
             profile_display = cluster_profiles[
                 [
                     "매출금액 구간",
@@ -579,7 +612,6 @@ def main():
                 title="클러스터 분포 (크기: 업종 내 순위, 작을수록 상위)",
             )
 
-            # 현재 가맹점 표시
             current_sales = store_cluster_info["매출금액 구간"].iloc[0]
             current_revisit = store_cluster_info["재방문 고객 비중"].iloc[0]
             if pd.notna(current_revisit):
@@ -601,7 +633,6 @@ def main():
             fig.update_layout(height=350)
             st.plotly_chart(fig, use_container_width=True)
 
-        # 유사 가맹점 추천
         st.markdown("#### 유사 가맹점 (같은 클러스터)")
         similar_stores = get_similar_stores(store_id, df_clustered, n=5)
 
@@ -614,7 +645,6 @@ def main():
     st.markdown("---")
     st.subheader("👥 고객층 분석")
 
-    # 최근 월 데이터
     latest_data = store_data.iloc[-1]
 
     col1, col2 = st.columns(2)
@@ -689,6 +719,128 @@ def main():
             st.plotly_chart(fig, use_container_width=True)
         else:
             st.info("고객 유형 데이터가 없습니다.")
+
+
+# ==================== 챗봇 페이지 ====================
+def chatbot_page():
+    """AI 컨설턴트 챗봇 페이지"""
+    st.title("🤖 AI 컨설턴트")
+    st.markdown("가맹점 데이터 분석 및 마케팅 전략을 AI에게 질문하세요!")
+
+    # 챗봇 초기화
+    chatbot, error = get_chatbot()
+
+    if error:
+        st.error(f"챗봇을 사용할 수 없습니다: {error}")
+        st.info(
+            "챗봇을 사용하려면 다음을 확인하세요:\n1. .env 파일에 API_KEY 설정\n2. 필요한 패키지 설치 (langchain, langgraph, langchain-google-genai 등)"
+        )
+        return
+
+    # 선택된 가맹점 정보 표시
+    if "selected_store" in st.session_state:
+        store = st.session_state["selected_store"]
+        with st.expander("📍 현재 선택된 가맹점", expanded=False):
+            st.write(
+                f"**{store.get('가맹점명', 'N/A')}** ({store.get('브랜드구분코드', 'N/A')})"
+            )
+            st.write(
+                f"업종: {store.get('업종', 'N/A')} | 상권: {store.get('상권', 'N/A')}"
+            )
+            st.write(
+                f"평균 매출구간: {store.get('평균매출구간', 'N/A'):.1f}"
+                if store.get("평균매출구간")
+                else ""
+            )
+
+    # 채팅 기록 초기화
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = []
+
+    # 예시 질문 버튼
+    st.markdown("#### 💡 예시 질문")
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        if st.button("📊 매출 분석", use_container_width=True):
+            st.session_state.pending_question = (
+                "카페 업종의 평균 매출금액 구간은 어떻게 되나요?"
+            )
+
+    with col2:
+        if st.button("📈 마케팅 전략", use_container_width=True):
+            st.session_state.pending_question = (
+                "재방문 고객 비중을 높이기 위한 마케팅 전략을 제안해주세요."
+            )
+
+    with col3:
+        if st.button("🔍 경쟁 분석", use_container_width=True):
+            st.session_state.pending_question = (
+                "성수 상권의 한식 업종 경쟁 현황을 분석해주세요."
+            )
+
+    st.markdown("---")
+
+    # 채팅 기록 표시
+    for message in st.session_state.chat_history:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    # 사용자 입력
+    user_input = st.chat_input("질문을 입력하세요...")
+
+    # 예시 질문이 있으면 처리
+    if "pending_question" in st.session_state:
+        user_input = st.session_state.pending_question
+        del st.session_state.pending_question
+
+    if user_input:
+        # 사용자 메시지 추가
+        st.session_state.chat_history.append({"role": "user", "content": user_input})
+
+        with st.chat_message("user"):
+            st.markdown(user_input)
+
+        # AI 응답 생성
+        with st.chat_message("assistant"):
+            with st.spinner("분석 중..."):
+                try:
+                    response = chatbot.chat(user_input)
+                    st.markdown(response)
+                    st.session_state.chat_history.append(
+                        {"role": "assistant", "content": response}
+                    )
+                except Exception as e:
+                    error_msg = f"응답 생성 중 오류가 발생했습니다: {str(e)}"
+                    st.error(error_msg)
+                    st.session_state.chat_history.append(
+                        {"role": "assistant", "content": error_msg}
+                    )
+
+    # 대화 초기화 버튼
+    if st.button("🗑️ 대화 초기화"):
+        st.session_state.chat_history = []
+        st.rerun()
+
+
+# ==================== 메인 함수 ====================
+def main():
+    # 데이터 로드
+    with st.spinner("데이터를 불러오는 중..."):
+        df = load_data()
+        store_summary = get_store_summary(df)
+
+    # 사이드바 네비게이션
+    st.sidebar.title("🗂️ 메뉴")
+
+    page = st.sidebar.radio(
+        "페이지 선택", ["📊 대시보드", "🤖 AI 컨설턴트"], label_visibility="collapsed"
+    )
+
+    if page == "📊 대시보드":
+        dashboard_page(df, store_summary)
+    else:
+        chatbot_page()
 
 
 if __name__ == "__main__":
